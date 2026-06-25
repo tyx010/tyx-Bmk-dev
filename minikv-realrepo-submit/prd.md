@@ -1,156 +1,169 @@
-# MiniKV Unit/System Public Packet
+# MiniKV Public Packet
 
 ## Overview
 
-Build `minikv.py`, a compact in-memory key-value store with optional persistence. It should support the core workflows of a lightweight data store: set/get/delete string keys, bulk operations, integer counters, key expiry with TTL, key enumeration with glob patterns, and save/load persistence to disk.
+Build `minikv.py`, an in-memory data structure store library. It provides a single class for storing and manipulating strings, lists, sets, and hashes, with type enforcement and optional persistence.
 
-This task is designed around the distinction between local feature correctness and system correctness. Individual commands should work on their own, but the product is only complete if key state, expiry, type metadata, persistence, and failure recovery remain consistent across multi-command workflows.
+This task is designed around the distinction between single-method correctness and system-level correctness. Individual methods should work on their own, but the library is only complete if type enforcement, data structure semantics, and cross-method state consistency hold across multi-step workflows.
 
-The implementation language is Python 3.11. Place `minikv.py` at the root of your solution directory. It must run as:
+The implementation language is Python 3.11. Place `minikv.py` at the root of your solution directory. Use only the Python standard library.
 
-```console
-py -3.11 minikv.py [--dbfile PATH] COMMAND [ARGS...]
+Public API:
+
+```python
+from minikv import QueueServer
+
+server = QueueServer(use_gevent=False)
+server.kv_set('name', 'Alice')
+print(server.kv_get('name'))       # → 'Alice'
+server.kv_incr('counter')
+print(server.kv_get('counter'))    # → 1
+server.lpush('items', 'a', 'b')
+server.sadd('tags', 'python')
+server.hset('user:1', 'name', 'Alice')
 ```
 
-The optional `--dbfile PATH` flag specifies a persistent database file. When omitted, the store is entirely in-memory with no persistence between runs. When provided, the store should automatically load existing data from the file on startup and save on each mutating command.
-
-Data-returning commands must print results to stdout, one record per line where appropriate. JSON output must be compact single-line JSON. Failed commands must exit non-zero and print a useful message to stderr. The benchmark does not inspect private implementation details.
+The benchmark does not inspect private implementation details.
 
 ## Feature Set
 
-The product has seven feature modules:
+The product has six feature modules:
 
-1. String key-value operations (SET, GET, EXISTS, DELETE).
-2. Bulk operations (MSET, MGET).
-3. Integer counter operations (INCR, DECR).
-4. Key expiry (EXPIRE, TTL, PERSIST).
-5. Key enumeration and metadata (KEYS, TYPE, DBSIZE).
-6. Persistence (SAVE, LOAD, FLUSH).
-7. Error and atomicity behavior.
+1. String key-value operations — kv_set, kv_get, kv_delete, kv_exists, kv_incr, kv_decr.
+2. Bulk string operations — kv_mset, kv_mget.
+3. List operations — lpush, rpush, lpop, rpop, lrange.
+4. Set operations — sadd, srem, smembers, scard.
+5. Hash operations — hset, hget, hdel, hgetall.
+6. Key management and persistence — expire, kv_flush, save_to_disk, restore_from_disk.
 
-These modules are intentionally state-dependent. Keys set by SET are later read by GET; TTL reflects prior EXPIRE calls; INCR depends on the current value type; KEYS and DBSIZE reflect the accumulated state; SAVE/LOAD/FLUSH affect all persisted state.
+These modules are intentionally state-dependent. Values set by kv_set are later read by kv_get. List elements pushed by lpush appear in lrange output. Type enforcement prevents operations on mismatched key types. State is mutable — methods like smembers and hgetall return references to internal data structures.
 
 ## Global Invariants
 
-The following invariants define system correctness:
+- A key's type is determined by the first operation that created it: kv_set with string → KV type; kv_set with list → QUEUE type; kv_set with dict → HASH type; lpush/rpush → QUEUE type; sadd → SET type; hset → HASH type.
+- Type-restricted operations must raise `CommandError` on keys of the wrong type, preserving the key's original value and type.
+- kv_delete removes the key entirely; the name can be reused with a different type.
+- lpush inserts at the head; rpush appends at the tail. lrange uses Python slice semantics (start:end).
+- sadd deduplicates members. smembers returns the actual internal set object (mutable).
+- hset stores one field-value pair. hgetall returns the actual internal dict object (mutable).
+- kv_incr auto-creates at 0. kv_incr/kv_decr on non-integer values raises CommandError.
+- expire sets an expiry time. Expired keys are lazily removed.
+- kv_flush clears all keys. save_to_disk persists state; restore_from_disk restores it.
+- State is private to each QueueServer instance.
 
-- GET after SET must return the exact value that was set (after INCR/DECR, the string representation of the updated integer).
-- EXISTS must return 1 for keys that have been SET and not DELETEd or FLUSHed, and must return 0 after DELETE or FLUSH.
-- INCR/DECR on a non-existent key must create it with value "0" before incrementing/decrementing.
-- INCR/DECR on a key holding a non-integer string must fail and preserve the original value.
-- EXPIRE on a non-existent key must return 0 and not create the key.
-- TTL must return -2 for non-existent keys and -1 for keys without expiry.
-- After EXPIRE seconds have elapsed, GET must return (nil) and EXISTS must return 0.
-- PERSIST must remove expiry from an existing key; after PERSIST, TTL must return -1.
-- SAVE must persist all current data to the specified file. LOAD must restore it exactly.
-- FLUSH must remove all keys without affecting the db file (the file is only overwritten on the next mutating command or explicit SAVE).
-- DBSIZE must reflect the exact number of currently live (non-expired) keys.
-- TYPE must return "string" for SET/GET values and "integer" for INCR/DECR values.
-- Failed commands must not corrupt existing key state, expiry, or persisted data.
+## Class: QueueServer
 
-## Data Model
+### Constructor
 
-The store holds keys mapping to (value, type, optional_expiry) tuples. Types are "string" or "integer". Integer values stored via INCR/DECR are internally integers but serialized as their string representation.
+`QueueServer(use_gevent=False)`
 
-Timestamps for expiry are based on wall-clock time at second granularity. Expired keys should be lazily removed on access (GET, EXISTS) and also excluded from KEYS and DBSIZE.
+Create a new data store instance. The `use_gevent` parameter can be ignored for this task — always pass `False`.
 
-## Commands
+### String Operations
 
-### `SET key value [EX seconds]`
+#### `kv_set(key, value)`
+Store a value. Returns `1`. The type is auto-detected: dict → HASH, list → QUEUE, set → SET, anything else → KV (string). Overwrites any previous value and type.
 
-Set a string key. With `EX`, the key expires after the given number of seconds. Always returns `OK`.
+#### `kv_get(key)`
+Return the value, or `None` if the key does not exist or has expired.
 
-### `GET key`
+#### `kv_delete(key)`
+Remove the key. Returns `1` if deleted, `0` if not found.
 
-Return the value of the key, or `(nil)` if it does not exist or has expired.
+#### `kv_exists(key)`
+Return `1` if the key exists (not expired), `0` otherwise.
 
-### `EXISTS key`
+#### `kv_incr(key)`
+Increment the integer value by 1. Creates at 0 if key does not exist. Raises `CommandError` on non-numeric values (anything that is not `int` or `float`). Returns the new value.
 
-Return `1` if the key exists (and is not expired), `0` otherwise.
+#### `kv_decr(key)`
+Decrement by 1. Same semantics as kv_incr.
 
-### `DELETE key [key...]`
+### Bulk Operations
 
-Delete one or more keys. Return the number of keys that were actually removed (non-existent keys do not count).
+#### `kv_mset(__data=None, **kwargs)`
+Set multiple string keys from a dict and/or keyword arguments. Returns the count of keys set.
 
-### `MSET key1 value1 [key2 value2...]`
+#### `kv_mget(*keys)`
+Return a list of values. Missing keys appear as `None`.
 
-Set multiple string keys atomically. Always returns `OK`.
+### List Operations
 
-### `MGET key1 [key2...]`
+#### `lpush(key, *values)`
+Prepend values to the head of a list. Creates the list if it does not exist. Returns the number of values pushed.
 
-Return the values of the requested keys as a compact JSON array. Non-existent or expired keys appear as `null` in the array.
+#### `rpush(key, *values)`
+Append values to the tail. Creates the list if it does not exist. Returns the number of values pushed.
 
-### `INCR key`
+#### `lpop(key)`
+Remove and return the first element, or `None` if empty.
 
-Increment the integer value of a key by 1. If the key does not exist, set it to `0` before incrementing. Return the new integer value. Fail if the key holds a non-integer value.
+#### `rpop(key)`
+Remove and return the last element, or `None` if empty.
 
-### `DECR key`
+#### `lrange(key, start, end=None)`
+Return a list slice using Python slice semantics: `[start:end]`. `None` for end means "to the end". Raises `CommandError` on non-list keys.
 
-Decrement the integer value of a key by 1. If the key does not exist, set it to `0` before decrementing. Return the new integer value. Fail if the key holds a non-integer value.
+### Set Operations
 
-### `EXPIRE key seconds`
+#### `sadd(key, *members)`
+Add members to a set. Creates it if it does not exist. Returns the new cardinality.
 
-Set a timeout on key. Return `1` if the timeout was set, `0` if the key does not exist.
+#### `srem(key, *members)`
+Remove members. Returns the count of members actually removed.
 
-### `TTL key`
+#### `smembers(key)`
+Return the internal set object. If the key does not exist, creates an empty set first. Raises `CommandError` on non-set keys.
 
-Return the remaining time to live in seconds. Return `-1` if the key exists but has no expiry. Return `-2` if the key does not exist or has expired.
+#### `scard(key)`
+Return the cardinality. If the key does not exist, creates an empty set and returns `0`.
 
-### `PERSIST key`
+### Hash Operations
 
-Remove the expiry from a key. Return `1` if the expiry was removed, `0` if the key does not exist or has no expiry.
+#### `hset(key, field, value)`
+Set a field. Creates the hash if it does not exist. Returns `1`.
 
-### `KEYS [pattern]`
+#### `hget(key, field)`
+Return the field value, or `None` if not found.
 
-Return matching keys as a compact JSON array. If `pattern` is omitted, return all keys. The pattern supports `*` (any characters) and `?` (single character) glob wildcards. Expired keys must be excluded.
+#### `hdel(key, field)`
+Delete a field. Returns `1` if deleted, `0` if not found.
 
-### `TYPE key`
+#### `hgetall(key)`
+Return the internal dict object. If the key does not exist, creates an empty hash first. Raises `CommandError` on non-hash keys.
 
-Return the type of the value stored at key: `"string"`, `"integer"`, or `"none"` if the key does not exist or has expired.
+### Key Management
 
-### `DBSIZE`
+#### `expire(key, nseconds)`
+Set a timeout in seconds. Returns `None`.
 
-Return the number of currently live keys as an integer.
+#### `kv_flush()`
+Remove all keys. Returns the number of keys removed.
 
-### `SAVE path`
+#### `save_to_disk(filename)`
+Persist the entire database state to a file using pickle. Returns `True`.
 
-Persist the current database to a JSON file at `path`. The format should be a JSON object. Returns `OK`.
-
-### `LOAD path`
-
-Replace the current database with the contents of a previously saved JSON file at `path`. Returns `OK`. Fail if the file does not exist or contains invalid data.
-
-### `FLUSH`
-
-Remove all keys from the current database. Always returns `OK`.
+#### `restore_from_disk(filename)`
+Restore database state from a pickle file. Returns `True` if restored, `False` if the file does not exist.
 
 ## Error Behavior
 
-Invalid command syntax, missing required arguments, LOAD from a non-existent or malformed file, INCR/DECR on a non-integer value, and globally malformed values must fail with a non-zero exit code and useful stderr.
-
-Failed commands must not corrupt existing key state, expiry, type metadata, or persisted data. Ordinary commands with no matching results (e.g., KEYS returning an empty list, GET returning nil, EXISTS returning 0) should succeed with exit code 0.
+- `CommandError` is raised for type mismatches (e.g., lpush on a string key, hset on a list key, sadd on a hash key).
+- `CommandError` is raised for kv_incr/kv_decr on non-integer string values.
+- Error messages are descriptive strings (exact text not part of public API).
 
 ## Non-Goals
 
-- No network server or client protocol is required. This is a CLI-only tool.
-- No Redis protocol compatibility is required.
-- No data structure types beyond string and integer (no lists, sets, hashes).
-- No pub/sub, transactions, Lua scripting, or multi-threaded access.
-- No automatic expiry eviction thread is required; lazy expiry on access is sufficient.
-- No LRU/LFU eviction policies are required.
+- No network server or client protocol. Only the Python class API.
+- No RESP protocol, gevent integration, or connection handling.
+- No sorted sets, streams, pub/sub, transactions, or Lua scripting.
+- No scheduled task queue.
 
 ## Evaluation Style
 
 Hidden tests are split into two scores:
 
-- Unit tests exercise one feature module at a time. When a command needs existing key state, tests may set up state via direct command invocation of that same module rather than crossing module boundaries.
-- System tests exercise interactions across at least two feature modules. They inspect stdout, stderr, JSON outputs, key state via subsequent GET/EXISTS/TYPE calls, expiry behavior after time delays, and failed-command atomicity.
+- Unit tests exercise one feature module at a time using short Python snippets.
+- System tests exercise interactions across at least two modules.
 
-System tests are labeled by dimension:
-
-- `cross_feature_dataflow`
-- `state_accumulation`
-- `global_invariant`
-- `error_atomicity`
-- `operation_order_sensitivity`
-- `boundary_crossing`
+System tests are labeled by dimension: `cross_feature_dataflow`, `state_accumulation`, `global_invariant`, `error_atomicity`, `operation_order_sensitivity`, `boundary_crossing`.
