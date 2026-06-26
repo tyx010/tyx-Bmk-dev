@@ -1,10 +1,10 @@
-# MiniTemplate Unit/System Public Packet
+# MiniTemplate Public Packet
 
 ## Overview
 
-Build `minitemplate.py`, a compact template engine inspired by Jinja2. It parses template source text containing variables, conditionals, loops, filters, includes, and comments, then renders output by substituting real values from a context dictionary.
+Build `minitemplate.py`, a text template engine supporting variable substitution, conditionals, loops, block definitions, and variable assignment. It should handle common template patterns: injecting values with `{{ var }}`, branching with `{% if %}`, iterating with `{% for %}`, and organizing reusable sections with `{% block %}`.
 
-This task is designed around the distinction between local feature correctness and system correctness. Individual template features should work on their own, but the engine is only complete if variable scoping, filter pipelines, include resolution, loop state, comment stripping, and error recovery remain consistent across composed templates.
+This task is designed around the distinction between rendering a single template correctly and maintaining consistency across multiple renders, error recovery, and template compilation. Individual template features should work on their own, but the engine is only complete if parsed templates can be re-rendered with different contexts, undefined variables raise proper errors without corrupting the template, and conditionals/loops/blocks compose correctly.
 
 The implementation language is Python 3.11. Place `minitemplate.py` at the root of your solution directory. Use only the Python standard library.
 
@@ -12,59 +12,60 @@ Public API:
 
 ```python
 from minitemplate import Template, Environment
+from minitemplate import TemplateSyntaxError
 
-# Simple usage — parse and render in one step
-t = Template("Hello {{ name }}!")
-print(t.render(name="Alice"))
+# Simple template
+t = Template('Hello {{ name }}!')
+print(t.render(name='Alice'))          # → Hello Alice!
 
-# Environment usage — with loader for includes and custom filters
-env = Environment(loader={"header": "Title: {{ title }}"})
-env.add_filter("shout", lambda s: s.upper() + "!")
-t = env.from_string("{% include 'header' %}\n{{ msg | shout }}")
-print(t.render(title="Home", msg="welcome"))
+# Conditionals and loops
+t = Template('{% if show %}{% for i in items %}{{ i }}{% endfor %}{% endif %}')
+print(t.render(show=True, items=[1,2,3]))  # → 123
+
+# Environment (for advanced use)
+env = Environment()
+t = env.from_string('{{ greeting }} {{ name }}')
+print(t.render(greeting='Hi', name='Bob'))  # → Hi Bob
 ```
 
 The benchmark does not inspect private implementation details.
 
 ## Feature Set
 
-The product has seven feature modules:
+The product has six feature modules:
 
-1. Variable substitution — `{{ var }}`, dot notation `{{ obj.key }}`, and index access `{{ seq[0] }}`.
-2. Conditional blocks — `{% if cond %}`, `{% elif cond %}`, `{% else %}`, `{% endif %}`.
-3. Loop blocks — `{% for item in seq %}` / `{% endfor %}`, with `loop.index` and `loop.index0`.
-4. Built-in filters — `| upper`, `| lower`, `| default("x")`, `| length`, `| trim`, plus custom filter registration.
-5. Template includes — `{% include "name" %}` resolved via an environment loader.
-6. Comment handling — `{# ... #}` stripped from output.
-7. Error handling — undefined variables, syntax errors, missing includes, circular includes.
+1. Variable substitution — `{{ var }}`, `{{ obj.attr }}`, and `{{ d.key }}` with dot-notation access.
+2. Conditional blocks — `{% if cond %}`, `{% elif cond %}`, `{% else %}`, `{% endif %}` with comparison operators.
+3. Loop blocks — `{% for item in seq %}`, `{% else %}`, `{% endfor %}`.
+4. Block definitions — `{% block name %}`, `{% endblock %}` for reusable content sections.
+5. Variable assignment — `{% with name = value %}`, `{% endwith %}` scoped variable binding.
+6. Environment and error handling — `Environment` class for compilation, plus `TemplateSyntaxError` and `UndefinedError`.
 
-These modules are intentionally state-dependent. Variables defined in the render context flow through conditionals, loops, and filters. Include directives pull in sub-templates whose output becomes part of the parent. Loop variables shadow outer context. Filters transform values before they reach conditionals or final output.
+These modules are intentionally interdependent. Variable substitution feeds values into conditionals and loops. Block definitions interact with template rendering. The `Environment` class provides an alternative compilation path that produces the same `Template` objects. Errors during parsing (syntax) and rendering (undefined variables) must be properly isolated.
 
 ## Global Invariants
 
-The following invariants define system correctness:
-
-- Variables resolve to the innermost scope: render kwargs > loop variables > nothing (raises or empty string depending on strict mode).
-- Undefined variables in `{% if %}` and `{% elif %}` conditions should be treated as falsy (not error).
-- Dot notation `{{ obj.key }}` should first try dict key access, then object attribute access.
-- Filter pipelines `{{ val | filter1 | filter2 }}` apply left to right.
-- `loop.index` is 1-based, `loop.index0` is 0-based; both are only available inside `{% for %}` bodies.
-- Include paths are looked up in the environment loader dict. A missing include key must raise an error.
-- Comments `{# ... #}` must be completely stripped from output (not rendered as whitespace).
-- Failed template operations (parse error, render error) must not corrupt the Template or Environment object state for subsequent use.
-- Re-rendering the same Template instance with different context values must produce independent, correct results.
+- `Template.render()` must produce the same output for the same context regardless of how many times it is called.
+- A `Template` instance can be re-rendered with different contexts and each result is correct and independent.
+- `Environment.from_string()` produces `Template` instances with the same `render()` behavior as directly-constructed ones.
+- Undefined variables in `{{ }}` are silently rendered as empty strings.
+- Undefined variables in `{% if %}` conditions are treated as falsy.
+- Syntax errors (`{% if %}` without `{% endif %}`, etc.) must raise `TemplateSyntaxError` at parse time.
+- Block definitions in templates define named content sections that render their body content when the template is rendered.
+- `{% with %}` scoped variables shadow any outer variables of the same name only within the block.
+- Dot notation `obj.attr` first tries attribute access, then key/index access.
 
 ## Template Syntax
 
 ### Variables
 
 ```
-{{ var }}
-{{ obj.key }}
-{{ seq[0] }}
+{{ name }}
+{{ user.name }}
+{{ d.key }}
 ```
 
-Render-time keyword arguments become template variables. Dot notation accesses nested dict keys or object attributes (dict takes priority).
+Render-time keyword arguments become template variables. Dot notation accesses nested attributes or dict keys.
 
 ### Conditionals
 
@@ -78,115 +79,89 @@ Render-time keyword arguments become template variables. Dot notation accesses n
 {% endif %}
 ```
 
-Truthiness follows Python rules: `None`, `False`, `0`, empty string, empty list, empty dict are falsy; everything else is truthy. Undefined variables in conditions are treated as falsy.
+Supported comparison operators: `==`, `!=`, `<`, `>`, `<=`, `>=`, `in`, `not in`. Truthiness follows Python rules. Undefined variables in conditions raise `UndefinedError`.
 
 ### Loops
 
 ```
 {% for item in items %}
-  {{ loop.index }}: {{ item }}
+  {{ item }}
+{% else %}
+  No items.
 {% endfor %}
 ```
 
-Within the loop body, `item` is the current element and `loop` provides `loop.index` (1-based) and `loop.index0` (0-based). The loop variable shadows any outer variable of the same name.
+The `{% else %}` branch renders if the sequence is empty. The loop variable shadows any outer variable of the same name only within the loop body.
 
-### Filters
-
-```
-{{ name | upper }}
-{{ bio | default("No bio provided") | trim }}
-{{ items | length }}
-```
-
-Built-in filters:
-
-| Filter | Behavior |
-|--------|----------|
-| `upper` | Convert to uppercase string |
-| `lower` | Convert to lowercase string |
-| `default("x")` | Use default value if input is undefined, None, or empty string |
-| `length` | Return length of list/string |
-| `trim` | Strip leading and trailing whitespace |
-
-Custom filters are registered via `env.add_filter(name, func)`. Custom filters take precedence over built-in filters of the same name.
-
-### Includes
+### Block Definitions
 
 ```
-{% include "header" %}
+{% block header %}
+  Default header content.
+{% endblock %}
 ```
 
-The include name is looked up in the Environment's loader (a dict mapping names to template source strings). The included template is parsed and rendered with the same context as the parent. Includes may themselves include other templates. Circular includes must be detected and raise an error.
+Blocks define named sections. The block's body content is rendered where the block appears.
 
-### Comments
+### Variable Assignment
 
 ```
-{# This is a comment #}
+{% with x = 5 %}
+  Value: {{ x }}
+{% endwith %}
 ```
 
-Comments are stripped and produce no output.
+Creates a scoped variable binding. The variable is only accessible within the `{% with %}...{% endwith %}` block.
 
 ## API
 
-### `Template(source, *, env=None)`
+### `class Template`
 
-Parse a template string. The optional `env` is an `Environment` instance for includes and filters.
+#### `Template(source)`
 
-Methods:
-- `render(**context)` — render the template with keyword arguments as variables. Returns the rendered string.
+Parse a template string. Raises `TemplateSyntaxError` on syntax errors.
 
-### `Environment(loader=None)`
+#### `Template.render(**kwargs)`
 
-Create an environment for template resolution.
+Render the template with keyword arguments as variables. Returns the rendered string. Undefined variables are rendered as empty strings.
 
-Parameters:
-- `loader` — a dict mapping include names to template source strings.
+### `class Environment`
 
-Methods:
-- `from_string(source)` — parse a template string using this environment's loader and filters. Returns a `Template`.
-- `add_filter(name, func)` — register a custom filter function. `func` receives one argument (the value) and returns the filtered value. Raises if a built-in filter name is used (unless explicitly intended as an override — overriding is allowed).
+#### `Environment()`
+
+Create a template environment.
+
+#### `Environment.from_string(source)`
+
+Compile a template string. Returns a `Template` instance. Equivalent behavior to `Template(source)`.
+
+### Exceptions
+
+- `TemplateSyntaxError` — raised at parse time for malformed templates. Inherits from `Exception`.
 
 ## Error Behavior
 
-The following must raise exceptions:
-
-- **Undefined variable**: rendering `{{ missing }}` where `missing` is not in context must raise `UndefinedError` (a subclass of `NameError`).
-- **Syntax error**: unclosed `{% if %}` without `{% endif %}`, unclosed `{% for %}` without `{% endfor %}`, or malformed tags must raise `TemplateSyntaxError` (a subclass of `ValueError`).
-- **Missing include**: `{% include "nonexistent" %}` where the name is not in the loader must raise `IncludeError` (a subclass of `LookupError`).
-- **Circular include**: A chain of includes that loops back to an already-included template must raise `IncludeError`.
-
-Exception types should be importable:
-
-```python
-from minitemplate import Template, Environment
-from minitemplate import UndefinedError, TemplateSyntaxError, IncludeError
-```
-
-The exact error message text is not part of the public API.
+- Malformed templates (`{% if %}` without `{% endif %}`, `{% for %}` without `{% endfor %}`, unclosed blocks) must raise an error at parse time.
+- Undefined variables in `{{ }}` are silently rendered as empty strings (no error).
+- After a parse error, subsequent valid template creation must succeed.
+- The exact error message text is not part of the public API.
 
 ## Non-Goals
 
-- No template inheritance (`{% extends %}`, `{% block %}`).
-- No macro definitions (`{% macro %}`).
-- No raw/verbatim blocks (`{% raw %}`).
-- No autoescaping or HTML escaping.
-- No complex expressions in `{% if %}` (no `and`/`or`/`not` operators — just single variable or attribute truthiness checks).
-- No whitespace control modifiers (`{%-`, `-%}`).
-- No async rendering.
-- No file system loader — the loader is always an in-memory dict.
+- No template inheritance (`{% extends %}`).
+- No filters (`| upper`, `| lower`).
+- No comments (`{# ... #}`).
+- No includes (`{% include %}`).
+- No arithmetic expressions in templates (`{{ a + b }}`).
+- No function calls in templates (`{{ func() }}`).
+- No HTML escaping or auto-escaping.
+- No custom delimiters.
 
 ## Evaluation Style
 
 Hidden tests are split into two scores:
 
-- Unit tests exercise one feature module at a time using short Python snippets that import the module, create templates, and print rendered output.
-- System tests exercise interactions across at least two feature modules. They inspect rendered strings, exception types, variable scoping, filter pipelines, include chains, and error recovery.
+- Unit tests exercise one feature module at a time using short Python snippets.
+- System tests exercise interactions across at least two modules.
 
-System tests are labeled by dimension:
-
-- `cross_feature_dataflow`
-- `state_accumulation`
-- `global_invariant`
-- `error_atomicity`
-- `operation_order_sensitivity`
-- `boundary_crossing`
+System tests are labeled by dimension: `cross_feature_dataflow`, `state_accumulation`, `global_invariant`, `error_atomicity`, `operation_order_sensitivity`, `boundary_crossing`.
